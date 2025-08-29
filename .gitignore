@@ -1,0 +1,7 @@
+# Ignore generated order files
+data/orders.csv
+data/order_items.csv
+
+# Python cache files
+__pycache__/
+*.pyc
