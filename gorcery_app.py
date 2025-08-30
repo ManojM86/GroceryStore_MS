@@ -1,15 +1,22 @@
 # -*- coding: utf-8 -*-
 import streamlit as st
 import pandas as pd
-import os
+import os, io
 from datetime import datetime, date, time as dtime
 import uuid
+
+# PDF tools
+from reportlab.lib.pagesizes import LETTER
+from reportlab.lib import colors
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.units import inch
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
 
 # -----------------------
 # Paths & constants
 # -----------------------
 APP_DIR = os.path.dirname(__file__)
-DATA_DIR = os.path.join(APP_DIR, "data")        # repo folder
+DATA_DIR = os.path.join(APP_DIR, "data")                # repo folder
 DEFAULT_INVENTORY_PATH = os.path.join(DATA_DIR, "inventory.csv")
 
 REQUIRED_COLS = ["S.No", "Item Category", "Item Name", "Quantity available in stock", "Price"]
@@ -17,20 +24,6 @@ REQUIRED_COLS = ["S.No", "Item Category", "Item Name", "Quantity available in st
 # -----------------------
 # Utilities
 # -----------------------
-def read_inventory_csv(path: str) -> pd.DataFrame:
-    """Read CSV from path and normalize."""
-    df = pd.read_csv(path)
-    return normalize_inventory(df)
-
-def read_inventory_from_filelike(upload) -> pd.DataFrame:
-    """Read uploaded CSV/Excel and normalize."""
-    name = upload.name.lower()
-    if name.endswith(".xlsx") or name.endswith(".xls"):
-        df = pd.read_excel(upload)
-    else:
-        df = pd.read_csv(upload)
-    return normalize_inventory(df)
-
 def normalize_inventory(df: pd.DataFrame) -> pd.DataFrame:
     missing = [c for c in REQUIRED_COLS if c not in df.columns]
     if missing:
@@ -42,6 +35,10 @@ def normalize_inventory(df: pd.DataFrame) -> pd.DataFrame:
     df["Price"] = pd.to_numeric(df["Price"], errors="coerce").fillna(0.0).astype(float)
     df = df.dropna(subset=["Item Name"]).copy()
     return df
+
+def read_inventory_csv(path: str) -> pd.DataFrame:
+    df = pd.read_csv(path)
+    return normalize_inventory(df)
 
 def add_to_cart(item_row: pd.Series, qty: int):
     key = int(item_row["S.No"]) if pd.notna(item_row["S.No"]) else hash(item_row["Item Name"])
@@ -73,6 +70,79 @@ def cart_total():
 def reset_cart():
     st.session_state.cart = {}
 
+def make_pdf(order_id: str, customer_name: str, phone: str,
+             pickup_date: date, pickup_time: dtime,
+             items_df: pd.DataFrame, total: float) -> bytes:
+    """
+    Build a simple, clean itemized PDF receipt and return bytes.
+    """
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=LETTER, topMargin=36, bottomMargin=36, leftMargin=36, rightMargin=36)
+    styles = getSampleStyleSheet()
+    story = []
+
+    # Header
+    story.append(Paragraph("<b>Grocery Pickup – Order Receipt</b>", styles["Title"]))
+    story.append(Spacer(1, 0.15*inch))
+
+    # Order meta
+    meta = [
+        ["Order ID:", order_id],
+        ["Customer:", customer_name],
+        ["Phone:", phone],
+        ["Pickup:", f"{pickup_date} at {pickup_time.strftime('%H:%M')}"],
+        ["Payment:", "In-store only"],
+    ]
+    meta_table = Table(meta, hAlign="LEFT", colWidths=[1.2*inch, 4.8*inch])
+    meta_table.setStyle(TableStyle([
+        ("FONT", (0,0), (-1,-1), "Helvetica", 10),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 4),
+    ]))
+    story.append(meta_table)
+    story.append(Spacer(1, 0.25*inch))
+
+    # Items table
+    data = [["Item Category", "Item Name", "Qty", "Unit Price", "Line Total"]]
+    for _, row in items_df.iterrows():
+        data.append([
+            str(row["Item Category"]),
+            str(row["Item Name"]),
+            int(row["Qty"]),
+            f"${row['Unit Price']:.2f}",
+            f"${row['Line Total']:.2f}",
+        ])
+
+    tbl = Table(data, hAlign="LEFT", colWidths=[1.5*inch, 2.7*inch, 0.7*inch, 1.0*inch, 1.0*inch])
+    tbl.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#f0f0f0")),
+        ("TEXTCOLOR", (0,0), (-1,0), colors.black),
+        ("FONT", (0,0), (-1,0), "Helvetica-Bold", 10),
+        ("FONT", (0,1), (-1,-1), "Helvetica", 10),
+        ("GRID", (0,0), (-1,-1), 0.3, colors.HexColor("#cccccc")),
+        ("ALIGN", (2,1), (2,-1), "RIGHT"),
+        ("ALIGN", (3,1), (4,-1), "RIGHT"),
+        ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
+        ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.white, colors.HexColor("#fbfbfb")]),
+    ]))
+    story.append(tbl)
+    story.append(Spacer(1, 0.2*inch))
+
+    # Total
+    total_tbl = Table([["", "Total:", f"${total:,.2f}"]], colWidths=[4.2*inch, 1.0*inch, 1.0*inch])
+    total_tbl.setStyle(TableStyle([
+        ("FONT", (1,0), (1,0), "Helvetica-Bold", 11),
+        ("FONT", (2,0), (2,0), "Helvetica-Bold", 11),
+        ("ALIGN", (2,0), (2,0), "RIGHT"),
+    ]))
+    story.append(total_tbl)
+    story.append(Spacer(1, 0.25*inch))
+    story.append(Paragraph("Thank you! Please present this receipt when you come to pay and collect your order.", styles["Normal"]))
+
+    doc.build(story)
+    pdf_bytes = buf.getvalue()
+    buf.close()
+    return pdf_bytes
+
 # -----------------------
 # Streamlit App
 # -----------------------
@@ -82,32 +152,21 @@ st.set_page_config(page_title="Grocery Pickup (No Online Payment)", page_icon="�
 if "cart" not in st.session_state:
     st.session_state.cart = {}
 if "inventory" not in st.session_state:
-    # Try to load default inventory from the repo first
+    # Always load from repo (no upload UI)
     if os.path.exists(DEFAULT_INVENTORY_PATH):
         try:
             st.session_state.inventory = read_inventory_csv(DEFAULT_INVENTORY_PATH)
         except Exception as e:
             st.session_state.inventory = None
-            st.error(f"Failed to read default inventory at data/inventory.csv: {e}")
+            st.error(f"Failed to read data/inventory.csv: {e}")
     else:
         st.session_state.inventory = None
 
 st.title("🛒 Grocery Pickup — Order Online, Pay In-Store")
 
-with st.sidebar:
-    st.header("Inventory")
-    st.caption("The app loads `data/inventory.csv` from the repo by default. You may upload a file to override it at runtime (read-only).")
-    uploaded = st.file_uploader("Upload CSV or Excel (optional override)", type=["csv", "xlsx", "xls"])
-    if uploaded is not None:
-        try:
-            st.session_state.inventory = read_inventory_from_filelike(uploaded)
-            st.success("Inventory loaded from uploaded file (read-only).")
-        except Exception as e:
-            st.error(f"Failed to read uploaded inventory: {e}")
-
-# Require inventory
+# No upload / override in Cloud. If no inventory, stop.
 if st.session_state.inventory is None:
-    st.info("No inventory found. Please add `data/inventory.csv` to the repo or upload a file.")
+    st.error("Inventory not found. Please include `data/inventory.csv` in the repository.")
     st.stop()
 
 # -----------------------
@@ -132,7 +191,7 @@ with left:
     with st.form("add_to_cart_form", clear_on_submit=True):
         st.markdown("### Add to cart")
         item_names = inv["Item Name"].tolist()
-        if len(item_names) == 0:
+        if not item_names:
             st.info("No items available in this category.")
         else:
             chosen_name = st.selectbox("Item", item_names)
@@ -163,7 +222,7 @@ with right:
 st.markdown("---")
 st.header("Confirm Order (Pay In-Store)")
 
-# A placeholder to show confirmation & the download button after submit
+# Placeholder for showing the PDF download AFTER submit
 confirm_area = st.container()
 
 with st.form("checkout_form", clear_on_submit=False):
@@ -195,27 +254,31 @@ with st.form("checkout_form", clear_on_submit=False):
                     break
             if ok:
                 oid = f"ORD-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{str(uuid.uuid4())[:8].upper()}"
-                total = cart_total()
-
-                # Build a receipt and stash it for download OUTSIDE the form
-                receipt_df = pd.DataFrame({
-                    "Field": ["Order ID", "Name", "Phone", "Pickup Date", "Pickup Time", "Total"],
-                    "Value": [oid, customer_name, phone, str(p_date), p_time.strftime("%H:%M"), f"${total:,.2f}"]
-                })
+                items_df = cart_to_dataframe()
+                total_amt = cart_total()
+                # Build PDF and stash for download outside the form
                 st.session_state["last_order_id"] = oid
-                st.session_state["receipt_csv"] = receipt_df.to_csv(index=False).encode("utf-8")
-
+                st.session_state["receipt_pdf"] = make_pdf(
+                    order_id=oid,
+                    customer_name=customer_name,
+                    phone=phone,
+                    pickup_date=p_date,
+                    pickup_time=p_time,
+                    items_df=items_df,
+                    total=total_amt
+                )
                 st.success(f"Order placed! Your order ID is {oid}. Please pay at pickup.")
                 reset_cart()
 
-# Outside the form: show download button if we have a receipt
+# Show the PDF download button OUTSIDE the form
 with confirm_area:
-    if st.session_state.get("receipt_csv"):
+    pdf_bytes = st.session_state.get("receipt_pdf")
+    if pdf_bytes:
         st.download_button(
-            "Download Receipt (CSV)",
-            data=st.session_state["receipt_csv"],
-            file_name=f"{st.session_state['last_order_id']}_receipt.csv",
-            mime="text/csv"
+            "Download Receipt (PDF)",
+            data=pdf_bytes,
+            file_name=f"{st.session_state['last_order_id']}_receipt.pdf",
+            mime="application/pdf"
         )
 
-st.caption("Inventory is read-only. The app never modifies your file.")
+st.caption("Inventory is read-only and loaded from the repository.")
