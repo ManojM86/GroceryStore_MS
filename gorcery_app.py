@@ -5,13 +5,6 @@ import os, io
 from datetime import datetime, date, time as dtime
 import uuid
 
-# PDF tools
-from reportlab.lib.pagesizes import LETTER
-from reportlab.lib import colors
-from reportlab.lib.styles import getSampleStyleSheet
-from reportlab.lib.units import inch
-from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
-
 # -----------------------
 # Paths & constants
 # -----------------------
@@ -70,78 +63,39 @@ def cart_total():
 def reset_cart():
     st.session_state.cart = {}
 
-def make_pdf(order_id: str, customer_name: str, phone: str,
-             pickup_date: date, pickup_time: dtime,
-             items_df: pd.DataFrame, total: float) -> bytes:
+def make_itemized_csv(order_id: str, customer_name: str, phone: str,
+                      pickup_date: date, pickup_time: dtime,
+                      items_df: pd.DataFrame, total: float) -> bytes:
     """
-    Build a simple, clean itemized PDF receipt and return bytes.
+    Build an itemized CSV (as bytes) that includes order meta + full line items.
     """
-    buf = io.BytesIO()
-    doc = SimpleDocTemplate(buf, pagesize=LETTER, topMargin=36, bottomMargin=36, leftMargin=36, rightMargin=36)
-    styles = getSampleStyleSheet()
-    story = []
-
-    # Header
-    story.append(Paragraph("<b>Grocery Pickup – Order Receipt</b>", styles["Title"]))
-    story.append(Spacer(1, 0.15*inch))
-
+    buf = io.StringIO()
     # Order meta
-    meta = [
-        ["Order ID:", order_id],
-        ["Customer:", customer_name],
-        ["Phone:", phone],
-        ["Pickup:", f"{pickup_date} at {pickup_time.strftime('%H:%M')}"],
-        ["Payment:", "In-store only"],
-    ]
-    meta_table = Table(meta, hAlign="LEFT", colWidths=[1.2*inch, 4.8*inch])
-    meta_table.setStyle(TableStyle([
-        ("FONT", (0,0), (-1,-1), "Helvetica", 10),
-        ("BOTTOMPADDING", (0,0), (-1,-1), 4),
-    ]))
-    story.append(meta_table)
-    story.append(Spacer(1, 0.25*inch))
+    buf.write("Order ID,{}\n".format(order_id))
+    buf.write("Customer,{}\n".format(customer_name))
+    buf.write("Phone,{}\n".format(phone))
+    buf.write("Pickup,{} {}\n".format(pickup_date, pickup_time.strftime("%H:%M")))
+    buf.write("Payment,In-store only\n")
+    buf.write("\n")  # blank line
 
-    # Items table
-    data = [["Item Category", "Item Name", "Qty", "Unit Price", "Line Total"]]
-    for _, row in items_df.iterrows():
-        data.append([
-            str(row["Item Category"]),
-            str(row["Item Name"]),
-            int(row["Qty"]),
-            f"${row['Unit Price']:.2f}",
-            f"${row['Line Total']:.2f}",
-        ])
+    # Line items header
+    cols = ["Item Category", "Item Name", "Qty", "Unit Price", "Line Total"]
+    buf.write(",".join(cols) + "\n")
 
-    tbl = Table(data, hAlign="LEFT", colWidths=[1.5*inch, 2.7*inch, 0.7*inch, 1.0*inch, 1.0*inch])
-    tbl.setStyle(TableStyle([
-        ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#f0f0f0")),
-        ("TEXTCOLOR", (0,0), (-1,0), colors.black),
-        ("FONT", (0,0), (-1,0), "Helvetica-Bold", 10),
-        ("FONT", (0,1), (-1,-1), "Helvetica", 10),
-        ("GRID", (0,0), (-1,-1), 0.3, colors.HexColor("#cccccc")),
-        ("ALIGN", (2,1), (2,-1), "RIGHT"),
-        ("ALIGN", (3,1), (4,-1), "RIGHT"),
-        ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
-        ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.white, colors.HexColor("#fbfbfb")]),
-    ]))
-    story.append(tbl)
-    story.append(Spacer(1, 0.2*inch))
+    # Line items rows
+    for _, r in items_df.iterrows():
+        row = [
+            str(r["Item Category"]),
+            str(r["Item Name"]).replace(",", " "),  # avoid commas inside cell
+            str(int(r["Qty"])),
+            f"{float(r['Unit Price']):.2f}",
+            f"{float(r['Line Total']):.2f}",
+        ]
+        buf.write(",".join(row) + "\n")
 
-    # Total
-    total_tbl = Table([["", "Total:", f"${total:,.2f}"]], colWidths=[4.2*inch, 1.0*inch, 1.0*inch])
-    total_tbl.setStyle(TableStyle([
-        ("FONT", (1,0), (1,0), "Helvetica-Bold", 11),
-        ("FONT", (2,0), (2,0), "Helvetica-Bold", 11),
-        ("ALIGN", (2,0), (2,0), "RIGHT"),
-    ]))
-    story.append(total_tbl)
-    story.append(Spacer(1, 0.25*inch))
-    story.append(Paragraph("Thank you! Please present this receipt when you come to pay and collect your order.", styles["Normal"]))
-
-    doc.build(story)
-    pdf_bytes = buf.getvalue()
-    buf.close()
-    return pdf_bytes
+    # Total row
+    buf.write(",,,Total,{}\n".format(f"{total:,.2f}"))
+    return buf.getvalue().encode("utf-8")
 
 # -----------------------
 # Streamlit App
@@ -164,7 +118,7 @@ if "inventory" not in st.session_state:
 
 st.title("🛒 Grocery Pickup — Order Online, Pay In-Store")
 
-# No upload / override in Cloud. If no inventory, stop.
+# Require inventory
 if st.session_state.inventory is None:
     st.error("Inventory not found. Please include `data/inventory.csv` in the repository.")
     st.stop()
@@ -222,7 +176,7 @@ with right:
 st.markdown("---")
 st.header("Confirm Order (Pay In-Store)")
 
-# Placeholder for showing the PDF download AFTER submit
+# Placeholder for showing the CSV download AFTER submit
 confirm_area = st.container()
 
 with st.form("checkout_form", clear_on_submit=False):
@@ -256,9 +210,10 @@ with st.form("checkout_form", clear_on_submit=False):
                 oid = f"ORD-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{str(uuid.uuid4())[:8].upper()}"
                 items_df = cart_to_dataframe()
                 total_amt = cart_total()
-                # Build PDF and stash for download outside the form
+
+                # Build itemized CSV and stash for download outside the form
                 st.session_state["last_order_id"] = oid
-                st.session_state["receipt_pdf"] = make_pdf(
+                st.session_state["receipt_csv"] = make_itemized_csv(
                     order_id=oid,
                     customer_name=customer_name,
                     phone=phone,
@@ -267,18 +222,18 @@ with st.form("checkout_form", clear_on_submit=False):
                     items_df=items_df,
                     total=total_amt
                 )
+
                 st.success(f"Order placed! Your order ID is {oid}. Please pay at pickup.")
                 reset_cart()
 
-# Show the PDF download button OUTSIDE the form
+# Show the CSV download button OUTSIDE the form
 with confirm_area:
-    pdf_bytes = st.session_state.get("receipt_pdf")
-    if pdf_bytes:
+    if st.session_state.get("receipt_csv"):
         st.download_button(
-            "Download Receipt (PDF)",
-            data=pdf_bytes,
-            file_name=f"{st.session_state['last_order_id']}_receipt.pdf",
-            mime="application/pdf"
+            "Download Receipt (CSV)",
+            data=st.session_state["receipt_csv"],
+            file_name=f"{st.session_state['last_order_id']}_receipt.csv",
+            mime="text/csv"
         )
 
 st.caption("Inventory is read-only and loaded from the repository.")
