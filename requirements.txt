@@ -4,3 +4,4 @@ numpy
 streamlit==1.37.1
 pandas==2.2.2
 openpyxl==3.1.5
+reportlab==3.6.13
