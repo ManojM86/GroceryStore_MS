@@ -200,8 +200,14 @@ with right:
 # -----------------------
 # Checkout (no payment online)
 # -----------------------
+# -----------------------
+# Checkout (no payment online)
+# -----------------------
 st.markdown("---")
 st.header("Confirm Order (Pay In-Store)")
+
+# a placeholder to show confirmation & the download button after submit
+confirm_area = st.container()
 
 with st.form("checkout_form", clear_on_submit=False):
     c1, c2 = st.columns(2)
@@ -224,26 +230,38 @@ with st.form("checkout_form", clear_on_submit=False):
             # Validate against the uploaded (read-only) stock for this single order
             ok = True
             inv_now = st.session_state.inventory
-            for v in st.session_state.cart.values():
-                row = inv_now[inv_now["Item Name"] == v["Item Name"]]
-                if row.empty or int(row["Quantity available in stock"].iloc[0]) < v["qty"]:
+            for v in st.session_state.cart.items():
+                # v is (key, dict)
+                item = v[1]
+                row = inv_now[inv_now["Item Name"] == item["Item Name"]]
+                if row.empty or int(row["Quantity available in stock"].iloc[0]) < item["qty"]:
                     ok = False
-                    st.error(f"Not enough stock for {v['Item Name']} per your sheet. Please adjust quantity.")
+                    st.error(f"Not enough stock for {item['Item Name']} per your sheet. Please adjust quantity.")
                     break
             if ok:
                 oid = f"ORD-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{str(uuid.uuid4())[:8].upper()}"
                 total = cart_total()
-                persist_order(oid, customer_name, phone, p_date, p_time, total)
 
-                receipt = pd.DataFrame({
+                # Build a receipt DataFrame and stash it for download OUTSIDE the form
+                receipt_df = pd.DataFrame({
                     "Field": ["Order ID", "Name", "Phone", "Pickup Date", "Pickup Time", "Total"],
                     "Value": [oid, customer_name, phone, str(p_date), p_time.strftime("%H:%M"), f"${total:,.2f}"]
                 })
+                st.session_state["last_order_id"] = oid
+                st.session_state["receipt_csv"] = receipt_df.to_csv(index=False).encode("utf-8")
+
+                # On-page confirmation (inside form is OK)
                 st.success(f"Order placed! Your order ID is {oid}. Please pay at pickup.")
-                st.download_button("Download Receipt (CSV)",
-                                   data=receipt.to_csv(index=False).encode("utf-8"),
-                                   file_name=f"{oid}_receipt.csv",
-                                   mime="text/csv")
+
+                # Clear cart AFTER we’ve built the receipt
                 reset_cart()
 
-st.caption("Inventory shown is exactly what you uploaded. The app does not change it.")
+# Now, OUTSIDE the form, show the download button if we have a receipt
+with confirm_area:
+    if st.session_state.get("receipt_csv"):
+        st.download_button(
+            "Download Receipt (CSV)",
+            data=st.session_state["receipt_csv"],
+            file_name=f"{st.session_state['last_order_id']}_receipt.csv",
+            mime="text/csv"
+        )
